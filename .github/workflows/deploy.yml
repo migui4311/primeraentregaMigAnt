@@ -1,0 +1,41 @@
+name: Pipeline CI/CD a Amazon S3
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    # 1. Origen: Descargar el código del repositorio
+    - name: Descargar código fuente
+      uses: actions/checkout@v4
+
+    # 2. Prueba / Construcción: Ejecutar el script de test
+    - name: Ejecutar pruebas automáticas
+      run: |
+        chmod +x test.sh
+        ./test.sh
+
+    # 3. Autenticación en AWS con credenciales temporales
+    - name: Configurar credenciales de AWS
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+        aws-region: ${{ secrets.AWS_REGION }}
+
+    # 4. Despliegue: Copiar artefactos al bucket S3 con AWS CLI
+    - name: Desplegar artefactos a Amazon S3
+      run: |
+        aws s3 sync . s3://${{ secrets.S3_BUCKET_NAME }} --exclude ".git/*" --exclude ".github/*"
+
+    # 5. Verificación posterior al despliegue
+    - name: Comprobación posterior al despliegue
+      run: |
+        aws s3 ls s3://${{ secrets.S3_BUCKET_NAME }}/adminalertas.py
