@@ -1,7 +1,7 @@
 name: Antonio AWS development
 on:
   push:
-    branches: [development_antonio]
+    branches: [development_antonio, antonio/v2x-actions-check]
   pull_request:
     branches: [main, development_antonio]
 permissions:
