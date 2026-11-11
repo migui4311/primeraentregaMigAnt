@@ -1,0 +1,68 @@
+name: Antonio AWS development
+on:
+  push:
+    branches: [development_antonio]
+  pull_request:
+    branches: [main, development_antonio]
+permissions:
+  contents: read
+concurrency:
+  group: v2x-${{ github.ref }}
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install -r requirements.txt
+      - run: python -m unittest discover -s tests
+      - name: Build and package
+        run: |
+          mkdir releases
+          docker build -t "v2x-service:$GITHUB_SHA" .
+          docker build -f rsu/Dockerfile -t "v2x-rsu:$GITHUB_SHA" .
+          cd releases
+          for image in v2x-service v2x-rsu; do
+            docker save "$image:$GITHUB_SHA" | gzip > "$image.tar.gz"
+            sha256sum "$image.tar.gz" > "$image.sha256"
+          done
+        shell: bash
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'push'
+        with:
+          name: v2x-images
+          path: releases/
+  deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/development_antonio'
+    needs: ci
+    runs-on: ubuntu-latest
+    environment: antonio-development
+    env:
+      BUCKET: ${{ vars.ANTONIO_S3_BUCKET }}
+      SERVICE: ${{ vars.ANTONIO_EC2_INSTANCE_ID }}
+      RSU1: ${{ vars.ANTONIO_RSU_1_INSTANCE_ID }}
+      RSU2: ${{ vars.ANTONIO_RSU_2_INSTANCE_ID }}
+      TOPIC: ${{ vars.ANTONIO_TOPIC_ARN }}
+      QUEUE: ${{ vars.ANTONIO_QUEUE_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: v2x-images
+          path: releases/
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: us-east-1
+          aws-access-key-id: ${{ secrets.ANTONIO_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.ANTONIO_AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.ANTONIO_AWS_SESSION_TOKEN }}
+          allowed-account-ids: '364733575524'
+      - run: pip install -r requirements.txt
+      - name: Publish and deploy
+        run: |
+          [[ "$(aws sts get-caller-identity --query Account --output text)" == 364733575524 ]]
+          for file in releases/*; do
+            aws s3api put-object --bucket "$BUCKET" --expected-bucket-owner 364733575524 \
+              --key "releases/$GITHUB_SHA/${file##*/}" --body "$file" >/dev/null
+          done
+          python scripts/aws_deployment.py deploy --bucket "$BUCKET" --revision "$GITHUB_SHA" \
+            --instances "$SERVICE" "$RSU1" "$RSU2" --topic "$TOPIC" --queue "$QUEUE"

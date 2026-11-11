@@ -1,71 +1,49 @@
-
-
-
-import boto3
 import json
+import os
 
 
 
-sqs = boto3.client('sqs', region_name='us-east-1')
-queue_name = 'ColaEventos'
+def process(event, events, alerts, sns, topic):
+    event_id = event["event_id"]
+    if not isinstance(event_id, str) or not event_id:
+        raise ValueError("invalid event_id")
+    events.put_item(Item={"event_id": event_id, "event": json.dumps(event)})
+    if event["event_type"] == "peligro_carretera":
+        alert_id = f"cloud-{event_id}"
+        key = {"alert_id": alert_id}
+        if alerts.get_item(Key=key, ConsistentRead=True).get("Item"):
+            return
+        alert = {**key, "event_id": event_id, "origin": "cloud",
+                 "rule": event["event_type"], "location": event["location"]}
+        sns.publish(TopicArn=topic, Message=json.dumps(alert))
+        alerts.put_item(Item={**key, "alert": json.dumps(alert)})
+    print(json.dumps({"outcome": "processed", "event_id": event_id}), flush=True)
 
 
-try:
-    respuesta_url = sqs.get_queue_url(QueueName=queue_name)
-    queue_url = respuesta_url['QueueUrl']
-    print(f"V2X-SERVICE Iniciado. Escuchando en: {queue_url}")
-except Exception as e:
-    print(f"Error: No se encuentra la cola '{queue_name}'.")
-    exit()
+def main():
+    import boto3
 
-try:
+    sqs = boto3.client("sqs", region_name=os.getenv("AWS_REGION", "us-east-1"))
+    queue = sqs.get_queue_url(QueueName=os.getenv("QUEUE_NAME", "v2x-events"))["QueueUrl"]
+    db = boto3.resource("dynamodb", region_name=sqs.meta.region_name)
+    sns = boto3.client("sns", region_name=sqs.meta.region_name)
+    topic = os.environ["TOPIC_ARN"]
     while True:
-            # 2. Recibir mensajes de SQS (WaitTimeSeconds=10 hace 'Long Polling' para no gastar recursos)
-            respuesta = sqs.receive_message(
-                QueueUrl=queue_url,
-                MaxNumberOfMessages=10, # Recibir hasta 10 mensajes de golpe
-                WaitTimeSeconds=10
-            )
-
-            if 'Messages' in respuesta:
-                for mensaje in respuesta['Messages']:
-                    recibo_id = mensaje['ReceiptHandle']
-                    cuerpo_json = mensaje['Body']
-                    
-                    # 3. Leer el JSON del vehículo
-                    try:
-                        datos = json.loads(cuerpo_json)
-                        vehiculo = datos.get('source_id', 'Desconocido')
-                        tipo_evento = datos.get('event_type', 'rutina')
-                        
-                      
-                        if tipo_evento in ['frenado brusco', 'peligro_carretera']:
-                        
-                            print(f" ¡ALERTA CRÍTICA GENERADA EN LA NUBE! ")
-                            print(f"Motivo: {tipo_evento.upper()} detectado.")
-                            print(f"Vehículo implicado: {vehiculo}")
-                            print(f"Ubicación: {datos.get('location')}")
-
-                        else:
-                            print(f"Evento de rutina procesado para {vehiculo}.")
-                            
-                    except json.JSONDecodeError:
-                        print("Error: Se recibió un mensaje que no es JSON válido.")
-
-                    # 5. Eliminar el mensaje de la cola una vez procesado para no repetirlo
-                    sqs.delete_message(
-                        QueueUrl=queue_url,
-                        ReceiptHandle=recibo_id
-                    )
+        try:
+            messages = sqs.receive_message(QueueUrl=queue, WaitTimeSeconds=20,
+                                           MaxNumberOfMessages=10).get("Messages", [])
+            for message in messages:
+                try:
+                    process(json.loads(message["Body"]), db.Table("v2x-events"),
+                            db.Table("v2x-alerts"), sns, topic)
+                    sqs.delete_message(QueueUrl=queue, ReceiptHandle=message["ReceiptHandle"])
+                except Exception as error:
+                    print(f"Message retained for retry: {error}", flush=True)
+        except Exception as error:
+            import time
+            print(f"Receive failed: {error}", flush=True)
+            time.sleep(5)
 
 
-
-
-except KeyboardInterrupt:
-    print("\nServicio V2X detenido manualmente.")
-
-
-
-
-
-
+if __name__ == "__main__":
+    main()
