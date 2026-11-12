@@ -53,6 +53,28 @@ IP, subscribe the new endpoint and remove the old subscription. MQTT ingress
 is limited to the simulator IP specified during setup. Remove stale MQTT
 security group rules when that IP changes.
 
+## Miguel's Learner Lab
+
+Account `991872371561`, branch `development_miguel`, job `deploy-miguel`. No GitHub
+variables are needed: the deployment finds the bucket, instances, queue and topic by name.
+
+1. Create the infrastructure once. In the Learner Lab console open **CloudShell** (or use a
+   laptop profile and add `--profile miguel` before `--account`):
+
+   ```bash
+   git clone -b development_miguel https://github.com/migui4311/primeraentregaMigAnt.git
+   cd primeraentregaMigAnt
+   pip3 install --user boto3
+   python3 scripts/aws_deployment.py --account 991872371561 setup --simulator-cidr YOUR_PUBLIC_IPV4/32
+   ```
+
+   Wait a few minutes until the three instances are running and online in Systems Manager.
+2. Refresh the repository secrets `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and
+   `AWS_SESSION_TOKEN` with the current lab credentials.
+3. Push to `development_miguel` or re-run the workflow. `deploy-miguel` publishes the image
+   archives to S3, rolls them out through Systems Manager and subscribes both RSUs to SNS
+   (old public IPs are unsubscribed). Its log prints the simulator command with the RSU IPs.
+
 ## Run and verify
 
 ```powershell
@@ -76,3 +98,32 @@ using the same seed, rate and rounds. Save simulator and consumer output per run
 For component failure, stop the consumer container for 60 seconds during a
 longer run, sample SQS queue depth, then start it and record when the backlog
 drains. Record measured results in the submission report.
+
+## Measurements
+
+Every consumer log line is JSON: `processed` (with `latency_ms` from the vehicle timestamp
+and `queue_ms` from the SQS `SentTimestamp`), `duplicate`, `alert`, `retry`. The RSU logs
+`duplicate` when an event ID is still waiting in its outbox. A duplicate that arrives after
+the original left the outbox is detected by the consumer through a conditional DynamoDB write
+(`status` `processing` → `done`), so the final state stays consistent. Routine duplicates
+inside the 5-second window are filtered before deduplication.
+
+`latency_ms` compares the laptop clock with the EC2 clock. Synchronise the laptop first
+(Windows: `w32tm /resync`). `queue_ms` only uses AWS clocks.
+
+```bash
+python local_files/coches.py --rsu RSU1_IP RSU2_IP --rate 5 --rounds 40 --seed 7 --duplicate 0.2 > sim.log
+python scripts/metrics.py --profile miguel logs --since 15m --out consumer.log
+python scripts/metrics.py --profile miguel logs --since 15m --instance v2x-rsu-1 --out rsu1.log
+python scripts/metrics.py --profile miguel logs --since 15m --instance v2x-rsu-2 --out rsu2.log
+python scripts/metrics.py --profile miguel summary --sim sim.log --consumer consumer.log --rsu rsu1.log rsu2.log --dynamodb
+```
+
+The summary reports publishes, unique events, duplicates absorbed per RSU and in the cloud,
+processed and lost counts per event type and per RSU, retries, cloud alerts, latency
+p50/p95/max and the DynamoDB final-state check. For the component-failure experiment, sample
+the queue while the consumer is stopped:
+
+```bash
+python scripts/metrics.py --profile miguel queue --interval 5 --out queue.csv
+```

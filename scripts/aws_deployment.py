@@ -134,6 +134,57 @@ def rollout(session, bucket, revision, instances, topic, queue):
         raise RuntimeError(f"Failed: {failed}. Still pending: {pending}")
 
 
+def running_instance(ec2, name):
+    reservations = ec2.describe_instances(Filters=[
+        {"Name": "tag:Name", "Values": [name]},
+        {"Name": "instance-state-name", "Values": ["running"]},
+    ])["Reservations"]
+    instances = [instance for reservation in reservations for instance in reservation["Instances"]]
+    if len(instances) != 1:
+        raise RuntimeError(f"Expected one running instance tagged {name}, found {len(instances)}. "
+                           "Run setup first and wait until the instances are running.")
+    return instances[0]
+
+
+def discover(session, account):
+    """Find the resources created by setup, so a deployment needs no GitHub variables."""
+    ec2 = session.client("ec2")
+    return {
+        "bucket": f"v2x-artifacts-{account}-us-east-1",
+        "instances": [running_instance(ec2, name)["InstanceId"]
+                      for name in ("v2x-service", "v2x-rsu-1", "v2x-rsu-2")],
+        "topic": session.client("sns").create_topic(Name="v2x-alerts")["TopicArn"],
+        "queue": session.client("sqs").get_queue_url(QueueName="v2x-events")["QueueUrl"],
+    }
+
+
+def subscribe(session, topic, rsu_instances):
+    """Subscribe each RSU's current public IP to SNS and remove endpoints of old IPs."""
+    ec2 = session.client("ec2")
+    sns = session.client("sns")
+    reservations = ec2.describe_instances(InstanceIds=rsu_instances)["Reservations"]
+    ips = [instance.get("PublicIpAddress") for r in reservations for instance in r["Instances"]]
+    if not all(ips):
+        raise RuntimeError("Every RSU instance needs a public IPv4 address")
+    wanted = {f"http://{ip}:8080/sns" for ip in ips}
+    current = []
+    for page in sns.get_paginator("list_subscriptions_by_topic").paginate(TopicArn=topic):
+        current += page["Subscriptions"]
+    for item in current:
+        confirmed = item["SubscriptionArn"].startswith("arn:")
+        if item["Protocol"] == "http" and item["Endpoint"] not in wanted and confirmed:
+            sns.unsubscribe(SubscriptionArn=item["SubscriptionArn"])
+            print(f"Removed stale subscription {item['Endpoint']}")
+    confirmed = {item["Endpoint"] for item in current if item["SubscriptionArn"].startswith("arn:")}
+    for endpoint in sorted(wanted):
+        if endpoint in confirmed:
+            print(f"Already subscribed {endpoint}")
+        else:
+            sns.subscribe(TopicArn=topic, Protocol="http", Endpoint=endpoint)
+            print(f"Subscribed {endpoint} (the RSU confirms it)")
+    print("Simulator: python local_files/coches.py --rsu " + " ".join(ips))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile")
@@ -141,12 +192,15 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     provision = commands.add_parser("setup")
     provision.add_argument("--simulator-cidr", required=True)
-    deploy = commands.add_parser("deploy")
-    deploy.add_argument("--bucket", required=True)
+    deploy = commands.add_parser("deploy", help="omitted options are discovered from the account")
+    deploy.add_argument("--bucket")
     deploy.add_argument("--revision", required=True)
-    deploy.add_argument("--instances", nargs=3, required=True)
-    deploy.add_argument("--topic", required=True)
-    deploy.add_argument("--queue", required=True)
+    deploy.add_argument("--instances", nargs=3, metavar=("SERVICE", "RSU1", "RSU2"))
+    deploy.add_argument("--topic")
+    deploy.add_argument("--queue")
+    alerts = commands.add_parser("subscribe", help="subscribe both RSUs to v2x-alerts")
+    alerts.add_argument("--topic")
+    alerts.add_argument("--instances", nargs=2, metavar=("RSU1", "RSU2"))
     args = parser.parse_args()
     session = boto3.Session(profile_name=args.profile, region_name="us-east-1")
     account = session.client("sts").get_caller_identity()["Account"]
@@ -159,7 +213,14 @@ def main():
             parser.error("Simulator CIDR must identify one IPv4 address")
         setup(session, account, str(network))
     else:
-        rollout(session, args.bucket, args.revision, args.instances, args.topic, args.queue)
+        needed = (args.topic, args.instances) + ((args.bucket, args.queue) if args.command == "deploy" else ())
+        found = discover(session, account) if not all(needed) else {}
+        topic = args.topic or found["topic"]
+        if args.command == "deploy":
+            rollout(session, args.bucket or found["bucket"], args.revision,
+                    args.instances or found["instances"], topic, args.queue or found["queue"])
+        else:
+            subscribe(session, topic, args.instances or found["instances"][1:])
 
 
 if __name__ == "__main__":

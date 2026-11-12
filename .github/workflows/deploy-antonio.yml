@@ -1,7 +1,7 @@
 name: Antonio AWS development
 on:
   push:
-    branches: [development_antonio, antonio/v2x-actions-check]
+    branches: [development_antonio, antonio/v2x-actions-check, development_miguel]
   pull_request:
     branches: [main, development_antonio]
 permissions:
@@ -66,3 +66,36 @@ jobs:
           done
           python scripts/aws_deployment.py deploy --bucket "$BUCKET" --revision "$GITHUB_SHA" \
             --instances "$SERVICE" "$RSU1" "$RSU2" --topic "$TOPIC" --queue "$QUEUE"
+  # Same rollout in Miguel's Learner Lab. Uses the repository secrets AWS_ACCESS_KEY_ID,
+  # AWS_SECRET_ACCESS_KEY and AWS_SESSION_TOKEN (refresh them every lab session). Bucket,
+  # instances, queue and topic are discovered from the account, so no variables are needed.
+  deploy-miguel:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/development_miguel'
+    needs: ci
+    runs-on: ubuntu-latest
+    env:
+      ACCOUNT: '991872371561'
+      BUCKET: v2x-artifacts-991872371561-us-east-1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: v2x-images
+          path: releases/
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: us-east-1
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          allowed-account-ids: '991872371561'
+      - run: pip install -r requirements.txt
+      - name: Publish and deploy
+        run: |
+          for file in releases/*; do
+            aws s3api put-object --bucket "$BUCKET" --expected-bucket-owner "$ACCOUNT" \
+              --key "releases/$GITHUB_SHA/${file##*/}" --body "$file" >/dev/null
+          done
+          python scripts/aws_deployment.py --account "$ACCOUNT" deploy --revision "$GITHUB_SHA"
+      - name: Subscribe both RSUs to SNS
+        run: python scripts/aws_deployment.py --account "$ACCOUNT" subscribe

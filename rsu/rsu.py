@@ -93,7 +93,10 @@ def main():
                 if db.execute("SELECT count(*) FROM outbox").fetchone()[0] >= 10000:
                     print(f"Outbox full, rejected {event_id}", flush=True)
                     return
-                db.execute("INSERT OR IGNORE INTO outbox VALUES (?, ?)", (event_id, message.payload))
+                if not db.execute("INSERT OR IGNORE INTO outbox VALUES (?, ?)",
+                                  (event_id, message.payload)).rowcount:
+                    # Same event_id still waiting in the outbox: duplicate absorbed at the edge.
+                    print(json.dumps({"outcome": "duplicate", "event_id": event_id, "rsu_id": rsu}), flush=True)
             if kind == "rutina":
                 last_routine[source] = now
         except (KeyError, ValueError, TypeError, sqlite3.Error) as error:
