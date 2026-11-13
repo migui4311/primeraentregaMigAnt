@@ -188,7 +188,10 @@ def subscribe(session, topic, rsu_instances):
     ec2 = session.client("ec2")
     sns = session.client("sns")
     reservations = ec2.describe_instances(InstanceIds=rsu_instances)["Reservations"]
-    ips = [instance.get("PublicIpAddress") for r in reservations for instance in r["Instances"]]
+    # describe_instances does not keep the requested order: map by ID so rsu-1 stays first.
+    ip_by_id = {instance["InstanceId"]: instance.get("PublicIpAddress")
+                for r in reservations for instance in r["Instances"]}
+    ips = [ip_by_id.get(instance_id) for instance_id in rsu_instances]
     if not all(ips):
         raise RuntimeError("Every RSU instance needs a public IPv4 address")
     wanted = {f"http://{ip}:8080/sns" for ip in ips}
@@ -207,6 +210,8 @@ def subscribe(session, topic, rsu_instances):
         else:
             sns.subscribe(TopicArn=topic, Protocol="http", Endpoint=endpoint)
             print(f"Subscribed {endpoint} (the RSU confirms it)")
+    for index, (instance_id, ip) in enumerate(zip(rsu_instances, ips), 1):
+        print(f"rsu-{index}: {ip} ({instance_id})")
     print("Simulator: python local_files/coches.py --rsu " + " ".join(ips))
 
 
