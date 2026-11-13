@@ -90,6 +90,13 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           allowed-account-ids: '991872371561'
       - run: pip install -r requirements.txt
+      # Idempotent: creates whatever is missing (SQS + DLQ, SNS, DynamoDB, bucket, security
+      # groups, 3 EC2) and leaves existing resources as they are. MQTT (1883) is only opened
+      # to SIMULATOR_CIDR: change it here if Miguel's public IP changes.
+      - name: Create or update infrastructure
+        env:
+          SIMULATOR_CIDR: 46.222.99.126/32
+        run: python scripts/aws_deployment.py --account "$ACCOUNT" setup --simulator-cidr "$SIMULATOR_CIDR"
       - name: Publish and deploy
         run: |
           for file in releases/*; do

@@ -84,7 +84,24 @@ def setup(session, account, simulator_ip):
     print(json.dumps({"bucket": bucket, "instances": ids, "topic": topic, "queue": queue}, indent=2))
 
 
+def wait_for_ssm(session, instances, timeout=900):
+    """New instances need a few minutes before Systems Manager can run commands on them."""
+    ssm = session.client("ssm")
+    deadline = time.time() + timeout
+    while True:
+        info = ssm.describe_instance_information(
+            Filters=[{"Key": "InstanceIds", "Values": list(instances)}])["InstanceInformationList"]
+        missing = set(instances) - {item["InstanceId"] for item in info if item["PingStatus"] == "Online"}
+        if not missing:
+            return
+        if time.time() > deadline:
+            raise RuntimeError(f"Instances not online in Systems Manager: {sorted(missing)}")
+        print(f"Waiting for Systems Manager: {sorted(missing)}", flush=True)
+        time.sleep(15)
+
+
 def rollout(session, bucket, revision, instances, topic, queue):
+    wait_for_ssm(session, instances)
     ssm = session.client("ssm")
     pending = {}
     for index, instance in enumerate(instances):
@@ -98,7 +115,11 @@ def rollout(session, bucket, revision, instances, topic, queue):
         health = "curl -fsS http://localhost:8080/health" if index else (
             "test \"$(docker inspect -f '{{.State.Status}} {{.RestartCount}}' v2x-service)\" = 'running 0'")
         commands = [
-            "set -eu", "work=$(mktemp -d)", "trap 'rm -rf -- \"$work\"' EXIT", 'cd "$work"',
+            "set -eu",
+            # On a new instance, wait until the user data has installed Docker.
+            "cloud-init status --wait >/dev/null 2>&1 || true",
+            "command -v docker >/dev/null || { echo 'Docker is not installed yet' >&2; exit 1; }",
+            "work=$(mktemp -d)", "trap 'rm -rf -- \"$work\"' EXIT", 'cd "$work"',
             f"aws s3 cp {source}.tar.gz {name}.tar.gz",
             f"aws s3 cp {source}.sha256 {name}.sha256",
             f"sha256sum -c {name}.sha256", f"docker load -i {name}.tar.gz",
@@ -137,12 +158,16 @@ def rollout(session, bucket, revision, instances, topic, queue):
 def running_instance(ec2, name):
     reservations = ec2.describe_instances(Filters=[
         {"Name": "tag:Name", "Values": [name]},
-        {"Name": "instance-state-name", "Values": ["running"]},
+        {"Name": "instance-state-name", "Values": ["pending", "running"]},
     ])["Reservations"]
     instances = [instance for reservation in reservations for instance in reservation["Instances"]]
     if len(instances) != 1:
         raise RuntimeError(f"Expected one running instance tagged {name}, found {len(instances)}. "
-                           "Run setup first and wait until the instances are running.")
+                           "Run setup first.")
+    if instances[0]["State"]["Name"] == "pending":
+        ec2.get_waiter("instance_running").wait(InstanceIds=[instances[0]["InstanceId"]])
+        instances[0] = ec2.describe_instances(
+            InstanceIds=[instances[0]["InstanceId"]])["Reservations"][0]["Instances"][0]
     return instances[0]
 
 
