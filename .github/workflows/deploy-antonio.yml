@@ -95,7 +95,7 @@ jobs:
       # to SIMULATOR_CIDR: change it here if Miguel's public IP changes.
       - name: Create or update infrastructure
         env:
-          SIMULATOR_CIDR: 46.222.99.126/32
+          SIMULATOR_CIDR: 91.117.233.230/32
         run: python scripts/aws_deployment.py --account "$ACCOUNT" setup --simulator-cidr "$SIMULATOR_CIDR"
       - name: Publish and deploy
         run: |
