@@ -3,3 +3,4 @@ __pycache__/
 *.pem
 *.log
 queue.csv
+/V2X_PERSONAL_GUIDE.md
