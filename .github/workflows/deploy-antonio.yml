@@ -32,7 +32,7 @@ jobs:
           name: v2x-images
           path: releases/
   deploy:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/development_antonio'
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/antonio/v2x-final' || github.ref == 'refs/heads/development_antonio')
     needs: ci
     runs-on: ubuntu-latest
     environment: antonio-development
