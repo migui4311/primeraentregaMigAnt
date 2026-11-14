@@ -14,15 +14,14 @@ temporary credential values. Use `us-east-1`. Run from the repository root.
 ```powershell
 python -m pip install -r requirements.txt
 aws sts get-caller-identity --profile antonio
-python scripts/aws_deployment.py --profile antonio setup --simulator-cidr YOUR_PUBLIC_IPV4/32
 ```
 
-The account must be `364733575524`. The setup command prints the bucket, queue URL,
-topic ARN and instance IDs. Check that the three hosts appear online in Systems
-Manager and Docker is running before pushing.
+The account must be `364733575524`. The workflow uses existing AWS resources.
+Record the bucket, queue URL, topic ARN and three instance IDs. Check that the
+hosts are online in Systems Manager and have Docker running before deploying.
 
 Create the `antonio-development` GitHub environment and restrict it to
-`development_antonio`. Set these variables from the setup output.
+`development_antonio`. Set these variables from the existing resources.
 
 | Variable | Value |
 | --- | --- |
@@ -50,30 +49,8 @@ aws sns list-subscriptions-by-topic --profile antonio --region us-east-1 --topic
 
 Verify both subscription ARNs are confirmed. If a lab restart changes a public
 IP, subscribe the new endpoint and remove the old subscription. MQTT ingress
-is limited to the simulator IP specified during setup. Remove stale MQTT
+is limited to the simulator IP configured in the EC2 security groups. Remove stale MQTT
 security group rules when that IP changes.
-
-## Miguel's Learner Lab
-
-Account `991872371561`, branch `development_miguel`, job `deploy-miguel`. No GitHub
-variables are needed: the deployment finds the bucket, instances, queue and topic by name.
-
-1. Create the infrastructure once. In the Learner Lab console open **CloudShell** (or use a
-   laptop profile and add `--profile miguel` before `--account`):
-
-   ```bash
-   git clone -b development_miguel https://github.com/migui4311/primeraentregaMigAnt.git
-   cd primeraentregaMigAnt
-   pip3 install --user boto3
-   python3 scripts/aws_deployment.py --account 991872371561 setup --simulator-cidr YOUR_PUBLIC_IPV4/32
-   ```
-
-   Wait a few minutes until the three instances are running and online in Systems Manager.
-2. Refresh the repository secrets `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and
-   `AWS_SESSION_TOKEN` with the current lab credentials.
-3. Push to `development_miguel` or re-run the workflow. `deploy-miguel` publishes the image
-   archives to S3, rolls them out through Systems Manager and subscribes both RSUs to SNS
-   (old public IPs are unsubscribed). Its log prints the simulator command with the RSU IPs.
 
 ## Run and verify
 
@@ -105,7 +82,7 @@ Every consumer log line is JSON: `processed` (with `latency_ms` from the vehicle
 and `queue_ms` from the SQS `SentTimestamp`), `duplicate`, `alert`, `retry`. The RSU logs
 `duplicate` when an event ID is still waiting in its outbox. A duplicate that arrives after
 the original left the outbox is detected by the consumer through a conditional DynamoDB write
-(`status` `processing` → `done`), so the final state stays consistent. Routine duplicates
+(`status` `processing` â†’ `done`), so the final state stays consistent. Routine duplicates
 inside the 5-second window are filtered before deduplication.
 
 `latency_ms` compares the laptop clock with the EC2 clock. Synchronise the laptop first
@@ -113,10 +90,10 @@ inside the 5-second window are filtered before deduplication.
 
 ```bash
 python local_files/coches.py --rsu RSU1_IP RSU2_IP --rate 5 --rounds 40 --seed 7 --duplicate 0.2 > sim.log
-python scripts/metrics.py --profile miguel logs --since 15m --out consumer.log
-python scripts/metrics.py --profile miguel logs --since 15m --instance v2x-rsu-1 --out rsu1.log
-python scripts/metrics.py --profile miguel logs --since 15m --instance v2x-rsu-2 --out rsu2.log
-python scripts/metrics.py --profile miguel summary --sim sim.log --consumer consumer.log --rsu rsu1.log rsu2.log --dynamodb
+python scripts/metrics.py --profile antonio logs --since 15m --out consumer.log
+python scripts/metrics.py --profile antonio logs --since 15m --instance v2x-rsu-1 --out rsu1.log
+python scripts/metrics.py --profile antonio logs --since 15m --instance v2x-rsu-2 --out rsu2.log
+python scripts/metrics.py --profile antonio summary --sim sim.log --consumer consumer.log --rsu rsu1.log rsu2.log --dynamodb
 ```
 
 The summary reports publishes, unique events, duplicates absorbed per RSU and in the cloud,
@@ -125,5 +102,5 @@ p50/p95/max and the DynamoDB final-state check. For the component-failure experi
 the queue while the consumer is stopped:
 
 ```bash
-python scripts/metrics.py --profile miguel queue --interval 5 --out queue.csv
+python scripts/metrics.py --profile antonio queue --interval 5 --out queue.csv
 ```

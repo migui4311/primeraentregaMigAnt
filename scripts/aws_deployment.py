@@ -6,84 +6,6 @@ import time
 import boto3
 
 
-def setup(session, account, simulator_ip):
-    ec2 = session.client("ec2")
-    sqs = session.client("sqs")
-    sns = session.client("sns")
-    db = session.client("dynamodb")
-    s3 = session.client("s3")
-    vpc, = ec2.describe_vpcs(Filters=[{"Name": "is-default", "Values": ["true"]}])["Vpcs"]
-    vpc_id = vpc["VpcId"]
-    subnet = ec2.describe_subnets(Filters=[
-        {"Name": "vpc-id", "Values": [vpc_id]},
-        {"Name": "default-for-az", "Values": ["true"]},
-    ])["Subnets"][0]["SubnetId"]
-    ami = session.client("ssm").get_parameter(
-        Name="/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
-    )["Parameter"]["Value"]
-    dead = sqs.create_queue(QueueName="v2x-events-dlq")["QueueUrl"]
-    dead_arn = sqs.get_queue_attributes(QueueUrl=dead, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
-    queue = sqs.create_queue(QueueName="v2x-events", Attributes={
-        "ReceiveMessageWaitTimeSeconds": "20", "VisibilityTimeout": "60",
-        "RedrivePolicy": json.dumps({"deadLetterTargetArn": dead_arn, "maxReceiveCount": 5}),
-    })["QueueUrl"]
-    topic = sns.create_topic(Name="v2x-alerts")["TopicArn"]
-    for table, key in (("v2x-events", "event_id"), ("v2x-alerts", "alert_id")):
-        try:
-            db.create_table(TableName=table, BillingMode="PAY_PER_REQUEST",
-                            AttributeDefinitions=[{"AttributeName": key, "AttributeType": "S"}],
-                            KeySchema=[{"AttributeName": key, "KeyType": "HASH"}])
-        except db.exceptions.ResourceInUseException:
-            pass
-        db.get_waiter("table_exists").wait(TableName=table)
-    bucket = f"v2x-artifacts-{account}-us-east-1"
-    if bucket not in {item["Name"] for item in s3.list_buckets()["Buckets"]}:
-        s3.create_bucket(Bucket=bucket)
-    s3.put_public_access_block(Bucket=bucket, PublicAccessBlockConfiguration={
-        name: True for name in ("BlockPublicAcls", "IgnorePublicAcls",
-                                "BlockPublicPolicy", "RestrictPublicBuckets")})
-    s3.put_bucket_encryption(Bucket=bucket, ServerSideEncryptionConfiguration={"Rules": [
-        {"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}]})
-    ids = {}
-    for name in ("v2x-service", "v2x-rsu-1", "v2x-rsu-2"):
-        groups = ec2.describe_security_groups(Filters=[
-            {"Name": "group-name", "Values": [name]}, {"Name": "vpc-id", "Values": [vpc_id]}
-        ])["SecurityGroups"]
-        group = groups[0]["GroupId"] if groups else ec2.create_security_group(
-            GroupName=name, Description=f"V2X {name}", VpcId=vpc_id)["GroupId"]
-        if name != "v2x-service":
-            for port, cidr in ((1883, simulator_ip), (8080, "0.0.0.0/0")):
-                try:
-                    ec2.authorize_security_group_ingress(GroupId=group, IpProtocol="tcp",
-                                                         FromPort=port, ToPort=port, CidrIp=cidr)
-                except ec2.exceptions.ClientError as error:
-                    if error.response["Error"]["Code"] != "InvalidPermission.Duplicate":
-                        raise
-        reservations = ec2.describe_instances(Filters=[
-            {"Name": "tag:Name", "Values": [name]}, {"Name": "vpc-id", "Values": [vpc_id]},
-            {"Name": "instance-state-name", "Values": ["pending", "running", "stopped", "stopping"]},
-        ])["Reservations"]
-        instances = [instance for reservation in reservations for instance in reservation["Instances"]]
-        if instances:
-            instance, = instances
-            instance_id = instance["InstanceId"]
-            if instance["State"]["Name"] in {"stopped", "stopping"}:
-                ec2.get_waiter("instance_stopped").wait(InstanceIds=[instance_id])
-                ec2.start_instances(InstanceIds=[instance_id])
-        else:
-            instance_id = ec2.run_instances(
-                ImageId=ami, InstanceType="t3.micro", MinCount=1, MaxCount=1,
-                IamInstanceProfile={"Name": "LabInstanceProfile"},
-                MetadataOptions={"HttpTokens": "required", "HttpPutResponseHopLimit": 2},
-                NetworkInterfaces=[{"DeviceIndex": 0, "SubnetId": subnet, "Groups": [group],
-                                    "AssociatePublicIpAddress": True}],
-                TagSpecifications=[{"ResourceType": "instance", "Tags": [{"Key": "Name", "Value": name}]}],
-                UserData="#!/bin/bash\nset -e\ndnf install -y docker\nsystemctl enable --now docker\n",
-            )["Instances"][0]["InstanceId"]
-        ids[name] = instance_id
-    print(json.dumps({"bucket": bucket, "instances": ids, "topic": topic, "queue": queue}, indent=2))
-
-
 def wait_for_ssm(session, instances, timeout=900):
     """New instances need a few minutes before Systems Manager can run commands on them."""
     ssm = session.client("ssm")
@@ -155,34 +77,6 @@ def rollout(session, bucket, revision, instances, topic, queue):
         raise RuntimeError(f"Failed: {failed}. Still pending: {pending}")
 
 
-def running_instance(ec2, name):
-    reservations = ec2.describe_instances(Filters=[
-        {"Name": "tag:Name", "Values": [name]},
-        {"Name": "instance-state-name", "Values": ["pending", "running"]},
-    ])["Reservations"]
-    instances = [instance for reservation in reservations for instance in reservation["Instances"]]
-    if len(instances) != 1:
-        raise RuntimeError(f"Expected one running instance tagged {name}, found {len(instances)}. "
-                           "Run setup first.")
-    if instances[0]["State"]["Name"] == "pending":
-        ec2.get_waiter("instance_running").wait(InstanceIds=[instances[0]["InstanceId"]])
-        instances[0] = ec2.describe_instances(
-            InstanceIds=[instances[0]["InstanceId"]])["Reservations"][0]["Instances"][0]
-    return instances[0]
-
-
-def discover(session, account):
-    """Find the resources created by setup, so a deployment needs no GitHub variables."""
-    ec2 = session.client("ec2")
-    return {
-        "bucket": f"v2x-artifacts-{account}-us-east-1",
-        "instances": [running_instance(ec2, name)["InstanceId"]
-                      for name in ("v2x-service", "v2x-rsu-1", "v2x-rsu-2")],
-        "topic": session.client("sns").create_topic(Name="v2x-alerts")["TopicArn"],
-        "queue": session.client("sqs").get_queue_url(QueueName="v2x-events")["QueueUrl"],
-    }
-
-
 def subscribe(session, topic, rsu_instances):
     """Subscribe each RSU's current public IP to SNS and remove endpoints of old IPs."""
     ec2 = session.client("ec2")
@@ -220,37 +114,24 @@ def main():
     parser.add_argument("--profile")
     parser.add_argument("--account", default="364733575524")
     commands = parser.add_subparsers(dest="command", required=True)
-    provision = commands.add_parser("setup")
-    provision.add_argument("--simulator-cidr", required=True)
-    deploy = commands.add_parser("deploy", help="omitted options are discovered from the account")
-    deploy.add_argument("--bucket")
+    deploy = commands.add_parser("deploy", help="deploy to existing resources")
+    deploy.add_argument("--bucket", required=True)
     deploy.add_argument("--revision", required=True)
-    deploy.add_argument("--instances", nargs=3, metavar=("SERVICE", "RSU1", "RSU2"))
-    deploy.add_argument("--topic")
-    deploy.add_argument("--queue")
+    deploy.add_argument("--instances", nargs=3, required=True, metavar=("SERVICE", "RSU1", "RSU2"))
+    deploy.add_argument("--topic", required=True)
+    deploy.add_argument("--queue", required=True)
     alerts = commands.add_parser("subscribe", help="subscribe both RSUs to v2x-alerts")
-    alerts.add_argument("--topic")
-    alerts.add_argument("--instances", nargs=2, metavar=("RSU1", "RSU2"))
+    alerts.add_argument("--topic", required=True)
+    alerts.add_argument("--instances", nargs=2, required=True, metavar=("RSU1", "RSU2"))
     args = parser.parse_args()
     session = boto3.Session(profile_name=args.profile, region_name="us-east-1")
     account = session.client("sts").get_caller_identity()["Account"]
     if account != args.account:
         parser.error("AWS identity does not match deployment account")
-    if args.command == "setup":
-        from ipaddress import IPv4Network
-        network = IPv4Network(args.simulator_cidr)
-        if network.prefixlen != 32:
-            parser.error("Simulator CIDR must identify one IPv4 address")
-        setup(session, account, str(network))
+    if args.command == "deploy":
+        rollout(session, args.bucket, args.revision, args.instances, args.topic, args.queue)
     else:
-        needed = (args.topic, args.instances) + ((args.bucket, args.queue) if args.command == "deploy" else ())
-        found = discover(session, account) if not all(needed) else {}
-        topic = args.topic or found["topic"]
-        if args.command == "deploy":
-            rollout(session, args.bucket or found["bucket"], args.revision,
-                    args.instances or found["instances"], topic, args.queue or found["queue"])
-        else:
-            subscribe(session, topic, args.instances or found["instances"][1:])
+        subscribe(session, args.topic, args.instances)
 
 
 if __name__ == "__main__":
